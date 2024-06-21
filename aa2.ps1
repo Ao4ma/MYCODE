@@ -1,3 +1,8 @@
+# SSH接続のためのユーザー名、パスワード、サーバー名を定義します
+$sshUser = "Ycsvm103\Administrator"
+$sshPassword = ConvertTo-SecureString "#YamadaVM03" -AsPlainText -Force
+$sshServer = "Ycsvm103"
+
 # SSHのユーザー名とパスワードを使用してPSCredentialオブジェクトを作成します
 $sshCredential = New-Object System.Management.Automation.PSCredential ($sshUser, $sshPassword)
 
