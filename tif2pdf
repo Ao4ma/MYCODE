@@ -1,3 +1,211 @@
+class ProgressManager {
+    [int]$TotalFiles
+    [int]$ProcessedFiles
+
+    ProgressManager([int]$totalFiles) {
+        $this.TotalFiles = $totalFiles
+        $this.ProcessedFiles = 0
+    }
+
+    [void]UpdateProgress() {
+        $this.ProcessedFiles++
+        $percentComplete = ($this.ProcessedFiles / $this.TotalFiles) * 100
+        Write-Progress -Activity "進捗状況" -Status "$($this.ProcessedFiles) / $($this.TotalFiles)" -PercentComplete $percentComplete
+    }
+}
+
+class FolderManager {
+    [string]$CommonPath
+    [string[]]$SourceFolders
+
+    FolderManager([string]$commonPath, [string[]]$sourceFolders) {
+        $this.CommonPath = $commonPath
+        $this.SourceFolders = $sourceFolders
+    }
+
+    [int]GetTotalFiles() {
+        $totalFiles = 0
+        foreach ($sourceFolder in $this.SourceFolders) {
+            $sourceFolderPath = Join-Path $this.CommonPath -ChildPath $sourceFolder
+            $tiffFolder = Join-Path -Path $sourceFolderPath -ChildPath "ExpFile"
+            if (Test-Path -Path $tiffFolder) {
+                $totalFiles += (Get-ChildItem -Path $tiffFolder -Filter *.tif).Count
+            }
+        }
+        return $totalFiles
+    }
+
+    [array]GetTiffFiles([string]$sourceFolder, [int]$maxFilesToProcess) {
+        $sourceFolderPath = Join-Path $this.CommonPath -ChildPath $sourceFolder
+        $tiffFolder = Join-Path -Path $sourceFolderPath -ChildPath "ExpFile"
+        if (-not (Test-Path -Path $tiffFolder)) {
+            Write-Host "Error: Path does not exist - $tiffFolder"
+            return @()
+        }
+        return Get-ChildItem -Path $tiffFolder -Filter *.tif | Select-Object -First $maxFilesToProcess
+    }
+
+    [void]EnsureFolderExists([string]$folderPath) {
+        if (-not (Test-Path -Path $folderPath)) {
+            New-Item -Path $folderPath -ItemType Directory
+        }
+    }
+
+    [void]MoveFile([string]$sourcePath, [string]$destinationPath) {
+        Move-Item -Path $sourcePath -Destination $destinationPath -Force
+    }
+
+    [bool]WaitForPdfGeneration([string]$pdfFilePath, [int]$timeoutMinutes, [int]$sleepSeconds) {
+        $waittime = [datetime]::Now.AddMinutes($timeoutMinutes)
+        while ((-not (Test-Path -Path $pdfFilePath)) -and ([datetime]::Now -lt $waittime)) {
+            Start-Sleep -Seconds $sleepSeconds
+        }
+        return Test-Path -Path $pdfFilePath
+    }
+}
+
+class TiffToPdfConverter {
+    [string]$NetworkPath
+    [string]$LocalDrive
+    [string]$CommonPath
+    [string[]]$SourceFolders
+    [string]$PscanInFolder
+    [string]$PscanOutFolder
+    [int]$MaxFilesToProcess
+    [int]$TimeoutMinutes
+    [int]$SleepSeconds
+    [bool]$SkipConverted
+    [bool]$Reset
+    [ProgressManager]$ProgressManager
+    [FolderManager]$FolderManager
+
+    TiffToPdfConverter([string]$networkPath, [string]$localDrive, [string]$commonPath, [string[]]$sourceFolders, [string]$pscanInFolder, [string]$pscanOutFolder, [int]$maxFilesToProcess, [int]$timeoutMinutes, [int]$sleepSeconds, [bool]$skipConverted, [bool]$reset) {
+        $this.NetworkPath = $networkPath
+        $this.LocalDrive = $localDrive
+        $this.CommonPath = $commonPath
+        $this.SourceFolders = $sourceFolders
+        $this.PscanInFolder = $pscanInFolder
+        $this.PscanOutFolder = $pscanOutFolder
+        $this.MaxFilesToProcess = $maxFilesToProcess
+        $this.TimeoutMinutes = $timeoutMinutes
+        $this.SleepSeconds = $sleepSeconds
+        $this.SkipConverted = $skipConverted
+        $this.Reset = $reset
+        $this.FolderManager = [FolderManager]::new($commonPath, $sourceFolders)
+    }
+
+    [void]Initialize() {
+        # ネットワークドライブを一時的にマッピング
+        if (-not (Test-Path -Path $this.LocalDrive)) {
+            Write-Host "Mapping network drive..."
+            New-PSDrive -Name "Z" -PSProvider FileSystem -Root $this.NetworkPath -Persist
+        }
+
+        # ネットワークドライブの確認
+        if (-not (Test-Path -Path $this.CommonPath)) {
+            Write-Host "Error: Network drive not mapped correctly or path does not exist."
+            exit
+        }
+
+        # 変換リストの生成
+        $tiffListPath = Join-Path -Path $this.CommonPath -ChildPath "TIFF_LIST.txt"
+        if ($this.Reset -and (Test-Path -Path $tiffListPath)) {
+            Remove-Item -Path $tiffListPath -Force
+        }
+        if (-not (Test-Path -Path $tiffListPath)) {
+            New-Item -Path $tiffListPath -ItemType File
+        }
+
+        # リセットモードの場合、PDFフォルダとERRフォルダを削除
+        if ($this.Reset) {
+            foreach ($sourceFolder in $this.SourceFolders) {
+                $sourceFolderPath = Join-Path $this.CommonPath -ChildPath $sourceFolder
+                $pdfFolderBase = Join-Path -Path $sourceFolderPath -ChildPath "PDF"
+                $pdfErrFolderBase = Join-Path -Path $sourceFolderPath -ChildPath "ERR"
+                
+                if (Test-Path -Path $pdfFolderBase) {
+                    Remove-Item -Path $pdfFolderBase -Recurse -Force
+                }
+                if (Test-Path -Path $pdfErrFolderBase) {
+                    Remove-Item -Path $pdfErrFolderBase -Recurse -Force
+                }
+            }
+        }
+
+        # TIFFファイルの総数をカウント
+        $totalFiles = $this.FolderManager.GetTotalFiles()
+        $this.ProgressManager = [ProgressManager]::new($totalFiles)
+    }
+
+    [void]ProcessFiles() {
+        foreach ($sourceFolder in $this.SourceFolders) {
+            $tiffFiles = $this.FolderManager.GetTiffFiles($sourceFolder, $this.MaxFilesToProcess)
+
+            foreach ($tiffFile in $tiffFiles) {
+                $tiffFileName = $tiffFile.Name
+                $tiffFilePath = $tiffFile.FullName
+                $pdfFileName = [System.IO.Path]::ChangeExtension($tiffFileName, ".pdf")
+                $pdfFolderBase = Join-Path -Path (Join-Path $this.CommonPath -ChildPath $sourceFolder) -ChildPath "PDF"
+                $pdfFilePath = Join-Path -Path $pdfFolderBase -ChildPath $pdfFileName
+
+                # 既に変換済みのTIFFファイルをスキップ
+                if ($this.SkipConverted -and (Test-Path -Path $pdfFilePath)) {
+                    Write-Host "Skipping already converted file: $tiffFileName"
+                    continue
+                }
+
+                # TIFFファイルをPSCAN_INにコピー
+                Copy-Item -Path $tiffFilePath -Destination $this.PscanInFolder
+
+                # TIFF_LISTに追記
+                $tiffListPath = Join-Path -Path $this.CommonPath -ChildPath "TIFF_LIST.txt"
+                Add-Content -Path $tiffListPath -Value "$sourceFolder`t$tiffFileName`t" -NoNewline
+
+                # PDFファイルが生成されるかを待機
+                $pdfFilePath = Join-Path -Path $this.PscanOutFolder -ChildPath $pdfFileName
+                $pdfGenerated = $this.FolderManager.WaitForPdfGeneration($pdfFilePath, $this.TimeoutMinutes, $this.SleepSeconds)
+
+                if ($pdfGenerated) {
+                    # PDFフォルダの作成
+                    $this.FolderManager.EnsureFolderExists($pdfFolderBase)
+
+                    # PDFファイルを移動（既存のファイルがある場合は上書き）
+                    $this.FolderManager.MoveFile($pdfFilePath, $pdfFolderBase)
+
+                    # TIFF_LISTにOKを追記
+                    $timestamp = Get-Date -Format "yyyy/MM/dd HH:mm:ss"
+                    Add-Content -Path $tiffListPath -Value "OK`t$timestamp`n"
+
+                    # 処理状況を更新
+                    $this.ProgressManager.UpdateProgress()
+                } else {
+                    # タイムアウト処理
+                    $pdfErrFolderBase = Join-Path -Path (Join-Path $this.CommonPath -ChildPath $sourceFolder) -ChildPath "ERR"
+                    $this.FolderManager.EnsureFolderExists($pdfErrFolderBase)
+
+                    # TIFFファイルをERRフォルダに移動（既存のファイルがある場合は上書き）
+                    $this.FolderManager.MoveFile($tiffFilePath, $pdfErrFolderBase)
+
+                    # TIFF_LISTにNGを追記
+                    $timestamp = Get-Date -Format "yyyy/MM/dd HH:mm:ss"
+                    Add-Content -Path $tiffListPath -Value "NG`t$timestamp`n"
+
+                    # 処理状況を更新
+                    $this.ProgressManager.UpdateProgress()
+                }
+            }
+        }
+    }
+
+    [void]Cleanup() {
+        # ネットワークドライブを解除
+        if (Get-PSDrive -Name "Z" -ErrorAction SilentlyContinue) {
+            Remove-PSDrive -Name "Z" -Force
+            Write-Host "Network drive Z: has been removed."
+        }
+    }
+}
+
 param (
     [switch]$debug,
     [switch]$SkipConverted = $true,
@@ -5,65 +213,10 @@ param (
     [switch]$ShowDialog
 )
 
-if ($ShowDialog) {
-    Add-Type -AssemblyName System.Windows.Forms
-
-    # 処理状況を表示するためのフォームを作成
-    $form = New-Object Windows.Forms.Form
-    $form.Text = "Processing Status"
-    $form.Size = New-Object Drawing.Size(600, 400)
-    $form.StartPosition = "CenterScreen"
-
-    # DataGridViewを作成
-    $dataGridView = New-Object Windows.Forms.DataGridView
-    $dataGridView.Size = New-Object Drawing.Size(580, 350)
-    $dataGridView.Location = New-Object Drawing.Point(10, 10)
-    $dataGridView.ColumnCount = 3
-    $dataGridView.Columns[0].Name = "FileName"
-    $dataGridView.Columns[1].Name = "Status"
-    $dataGridView.Columns[2].Name = "Timestamp"
-    $form.Controls.Add($dataGridView)
-
-    # フォームを表示
-    $form.Show()
-
-    # 処理状況を更新する関数
-    function Update-GridView {
-        param (
-            [string]$fileName,
-            [string]$status,
-            [string]$timestamp
-        )
-        $dataGridView.Rows.Add($fileName, $status, $timestamp)
-        $form.Refresh()
-    }
-} else {
-    # ダミーの関数を定義しておく
-    function Update-GridView {
-        param (
-            [string]$fileName,
-            [string]$status,
-            [string]$timestamp
-        )
-    }
-}
-
 # ネットワークドライブの設定
 $networkPath = if ($debug) { "\\DELLD033\技術部" } else { "\\ycsvm112\技術部" }
 $localDrive = "Z:"
 $commonPath = "Z:\管理課\管理課共有資料\ArcSuite\eValue図面検索データ_240310\"
-
-# ネットワークドライブを一時的にマッピング
-if (-not (Test-Path -Path $localDrive)) {
-    Write-Host "Mapping network drive..."
-    New-PSDrive -Name "Z" -PSProvider FileSystem -Root $networkPath -Persist
-}
-
-# ネットワークドライブの確認
-if (-not (Test-Path -Path $commonPath)) {
-    Write-Host "Error: Network drive not mapped correctly or path does not exist."
-    exit
-}
 
 # 変換元フォルダのリスト（全角の「￥」をそのまま使用）
 $sourceFolders = @(
@@ -81,110 +234,18 @@ $maxFilesToProcess = if ($debug) { 2 } else { [int]::MaxValue }
 $pscanInFolder = "\\10.23.2.28\HGPscanServPlus5\Job02_OCR\OCR_IN"
 $pscanOutFolder = "\\10.23.2.28\HGPscanServPlus5\Job02_OCR\OCR_OUT"
 
-# 変換リストの生成
-$tiffListPath = Join-Path -Path $commonPath -ChildPath "TIFF_LIST.txt"
-if ($Reset -and (Test-Path -Path $tiffListPath)) {
-    Remove-Item -Path $tiffListPath -Force
-}
-if (-not (Test-Path -Path $tiffListPath)) {
-    New-Item -Path $tiffListPath -ItemType File
-}
-
 # 待機時間の設定
 $timeoutMinutes = 1
 $sleepSeconds = 10
 
-# リセットモードの場合、PDFフォルダとERRフォルダを削除
-if ($Reset) {
-    foreach ($sourceFolder in $sourceFolders) {
-        $sourceFolderPath = Join-Path $commonPath -ChildPath $sourceFolder
-        $pdfFolderBase = Join-Path -Path $sourceFolderPath -ChildPath "PDF"
-        $pdfErrFolderBase = Join-Path -Path $sourceFolderPath -ChildPath "ERR"
-        
-        if (Test-Path -Path $pdfFolderBase) {
-            Remove-Item -Path $pdfFolderBase -Recurse -Force
-        }
-        if (Test-Path -Path $pdfErrFolderBase) {
-            Remove-Item -Path $pdfErrFolderBase -Recurse -Force
-        }
-    }
-}
+# TiffToPdfConverterクラスのインスタンスを作成
+$converter = [TiffToPdfConverter]::new($networkPath, $localDrive, $commonPath, $sourceFolders, $pscanInFolder, $pscanOutFolder, $maxFilesToProcess, $timeoutMinutes, $sleepSeconds, $SkipConverted, $Reset)
 
-# TIFFファイルの抽出と処理
-foreach ($sourceFolder in $sourceFolders) {
-    $sourceFolderPath = Join-Path $commonPath -ChildPath $sourceFolder
-    $tiffFolder = Join-Path -Path $sourceFolderPath -ChildPath "ExpFile"
-    $pdfFolderBase = Join-Path -Path $sourceFolderPath -ChildPath "PDF"
-    $pdfErrFolderBase = Join-Path -Path $sourceFolderPath -ChildPath "ERR"
-        
-    if (-not (Test-Path -Path $tiffFolder)) {
-        Write-Host "Error: Path does not exist - $tiffFolder"
-        continue
-    }
+# 初期化
+$converter.Initialize()
 
-    $tiffFiles = Get-ChildItem -Path $tiffFolder -Filter *.tif | Select-Object -First $maxFilesToProcess
+# ファイルの処理
+$converter.ProcessFiles()
 
-    foreach ($tiffFile in $tiffFiles) {
-        $tiffFileName = $tiffFile.Name
-        $tiffFilePath = $tiffFile.FullName
-        $pdfFileName = [System.IO.Path]::ChangeExtension($tiffFileName, ".pdf")
-        $pdfFilePath = Join-Path -Path $pdfFolderBase -ChildPath $pdfFileName
-
-        # 既に変換済みのTIFFファイルをスキップ
-        if ($SkipConverted -and (Test-Path -Path $pdfFilePath)) {
-            Write-Host "Skipping already converted file: $tiffFileName"
-            continue
-        }
-
-        # TIFFファイルをPSCAN_INにコピー
-        Copy-Item -Path $tiffFilePath -Destination $pscanInFolder
-
-        # TIFF_LISTに追記
-        Add-Content -Path $tiffListPath -Value "$sourceFolder`t$tiffFileName`t" -NoNewline
-
-        # PDFファイルが生成されるかを1分間（10秒ごとにチェック）待機する処理
-        $pdfFilePath = Join-Path -Path $pscanOutFolder -ChildPath $pdfFileName
-        $waittime = [datetime]::Now.AddMinutes($timeoutMinutes)
-        while ((-not (Test-Path -Path $pdfFilePath)) -and ([datetime]::Now -lt $waittime)) {
-            Start-Sleep -Seconds $sleepSeconds
-        }
-
-        if (Test-Path -Path $pdfFilePath) {
-            # PDFフォルダの作成
-            if (-not (Test-Path -Path $pdfFolderBase)) {
-                New-Item -Path $pdfFolderBase -ItemType Directory
-            }
-
-            # PDFファイルを移動（既存のファイルがある場合は上書き）
-            Move-Item -Path $pdfFilePath -Destination $pdfFolderBase -Force
-
-            # TIFF_LISTにOKを追記
-            $timestamp = Get-Date -Format "yyyy/MM/dd HH:mm:ss"
-            Add-Content -Path $tiffListPath -Value "OK`t$timestamp`n"
-
-            # 処理状況を更新
-            Update-GridView -fileName $tiffFileName -status "OK" -timestamp $timestamp
-        } else {
-            # タイムアウト処理
-            if (-not (Test-Path -Path $pdfErrFolderBase)) {
-                New-Item -Path $pdfErrFolderBase -ItemType Directory
-            }
-
-            # TIFFファイルをERRフォルダに移動（既存のファイルがある場合は上書き）
-            Move-Item -Path $tiffFilePath -Destination $pdfErrFolderBase -Force
-
-            # TIFF_LISTにNGを追記
-            $timestamp = Get-Date -Format "yyyy/MM/dd HH:mm:ss"
-            Add-Content -Path $tiffListPath -Value "NG`t$timestamp`n"
-
-            # 処理状況を更新
-            Update-GridView -fileName $tiffFileName -status "NG" -timestamp $timestamp
-        }
-    }
-}
-
-# ネットワークドライブを解除
-if (Get-PSDrive -Name "Z" -ErrorAction SilentlyContinue) {
-    Remove-PSDrive -Name "Z" -Force
-    Write-Host "Network drive Z: has been removed."
-}
+# クリーンアップ
+$converter.Cleanup()
